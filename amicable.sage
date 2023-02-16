@@ -22,7 +22,7 @@ DEFAULT_TWOADICITY = 32
 DEFAULT_STRETCH = 0
 
 COEFFICIENT_RANGE = (5,)
-#COEFFICIENT_RANGE = range(1, 100)
+COEFFICIENT_RANGE_ANY = range(1, 1000)
 
 GCD_PRIMES = (5, 7, 11, 13, 17)
 
@@ -100,6 +100,30 @@ def near_powerof2_order(L, twoadicity, wid, processes):
             if p > 1<<(L-1) and p % 6 == 1 and is_pseudoprime(p):
                 yield (p, T, V)
 
+def montgomery_friendly_order(L, twoadicity, wid, processes):
+    trailing_zeros = twoadicity+1
+    Vbase = math.isqrt((1<<(L))//3) >> trailing_zeros
+    for Voffset in symmetric_range(4000, base=wid, step=processes):
+        V = ((Vbase + Voffset) << trailing_zeros) + 1
+        assert(((V-1)/2) % (1 << twoadicity) == 0)
+        tmp = (1<<(L)) - 3*V**2
+        if tmp < 0: continue
+        Tbase = math.isqrt(tmp) >> trailing_zeros
+        for Toffset in symmetric_range(50000):
+            T = ((Tbase + Toffset) << trailing_zeros) + 1
+            assert(((T-1)/2) % (1<<twoadicity) == 0)
+            if T % 6 != 1:
+                continue
+            p4 = 3*V**2 + T**2
+            assert(p4 % 4 == 0)
+            p = p4//4
+            assert(p % (1<<twoadicity) == 1)
+            if (p % (1 << (L-63))) != 1:
+                continue
+
+            if p >= 1<<(L-1) and p < 1<<(L) and p % 6 == 1 and is_pseudoprime(p):
+                yield (p, T, V)
+
 def symmetric_range(n, base=0, step=1):
     for i in range(base, n, step):
         yield -i
@@ -107,7 +131,7 @@ def symmetric_range(n, base=0, step=1):
 
 SWAP_SIGNS = maketrans("+-", "-+")
 
-def find_nice_curves(strategy, L, twoadicity, stretch, requireisos, sortpq, twistsec, wid, processes):
+def find_nice_curves(strategy, L, twoadicity, stretch, requireisos, sortpq, twistsec, anyeqn, wid, processes):
     for (p, T, V) in strategy(L, max(0, twoadicity-stretch), wid, processes):
         if p % (1<<twoadicity) != 1:
             continue
@@ -125,10 +149,22 @@ def find_nice_curves(strategy, L, twoadicity, stretch, requireisos, sortpq, twis
                     (p, q) = (q, p)
                     qdesc = qdesc.translate(SWAP_SIGNS)
 
-                (Ep, bp) = find_curve(p, q)
-                if bp == None: continue
-                (Eq, bq) = find_curve(q, p, (bp,))
-                if bq == None: continue
+                if anyeqn:
+                    for b in COEFFICIENT_RANGE_ANY:
+                        Ep = EllipticCurve(GF(p), [0, b])
+                        if Ep.count_points() != q:
+                            continue
+                        Eq = EllipticCurve(GF(q), [0, b])
+                        if Eq.count_points() != p:
+                            continue
+                        bp = bq = b
+                        break
+                    if bp == None: continue
+                else:
+                    (Ep, bp) = find_curve(p, q)
+                    if bp == None: continue
+                    (Eq, bq) = find_curve(q, p, (bp,))
+                    if bq == None: continue
 
                 sys.stdout.write('*')
                 sys.stdout.flush()
@@ -236,30 +272,38 @@ def format_weight(x, detail=True):
     else:
         detailstr = " (bitlength %d)" % (len(X),)
 
-    return "%s0b%s%s" % ("-" if x < 0 else "", X, detailstr)
+    return "%s%s%s" % ("-" if x < 0 else "", hex(abs(x)), detailstr)
 
 
 def main():
     args = sys.argv[1:]
-    strategy = near_powerof2_order if "--nearpowerof2" in args else low_hamming_order
+    if "--nearpowerof2" in args:
+        strategy = near_powerof2_order
+    elif "--montgomery" in args:
+        strategy = montgomery_friendly_order
+    else:
+        strategy = low_hamming_order
     processes = 1 if "--sequential" in args else cpu_count()
     if processes >= 6:
         processes -= 2
     requireisos = "--requireisos" in args
     sortpq = "--sortpq" in args
     twistsec = 0 if "--ignoretwist" in args else DEFAULT_TWIST_SECURITY
+    anyeqn = "--anyeqn" in args
     args = [arg for arg in args if not arg.startswith("--")]
 
     if len(args) < 1:
         print("""
-Usage: sage amicable.sage [--sequential] [--requireisos] [--sortpq] [--ignoretwist] [--nearpowerof2] <min-bitlength> [<min-2adicity> [<stretch]]
+Usage: sage amicable.sage [--sequential] [--requireisos] [--sortpq] [--ignoretwist] [--anyeqn] [--nearpowerof2] [--montgomery] <min-bitlength> [<min-2adicity> [<stretch]]
 
 Arguments:
   --sequential     Use only one thread, avoiding non-determinism in the output order.
   --requireisos    Require isogenies useful for a "simplified SWU" hash to curve.
   --sortpq         Sort p smaller than q.
   --ignoretwist    Ignore twist security.
+  --anyeqn         Allow equations other than y^2 = x^3 + 5.
   --nearpowerof2   Search for primes near a power of 2, rather than with low Hamming weight.
+  --montgomery     Search for Montgomery-friendly primes, rather than primes with low Hamming weight.
   <min-bitlength>  Both primes should have this minimum bit length.
   <min-2adicity>   Both primes should have this minimum 2-adicity.
   <stretch>        Find more candidates, by filtering from 2-adicity smaller by this many bits.
@@ -275,10 +319,10 @@ Arguments:
 
     try:
         for wid in range(processes):
-            pool.apply_async(worker, (strategy, L, twoadicity, stretch, requireisos, sortpq, twistsec, wid, processes))
+            pool.apply_async(worker, (strategy, L, twoadicity, stretch, requireisos, sortpq, twistsec, anyeqn, wid, processes))
 
-        while True:
-            sleep(1000)
+        pool.close()
+        pool.join()
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
